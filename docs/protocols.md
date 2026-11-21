@@ -214,3 +214,4 @@ Content-Length: 1256\r\n
 ```
 
 Because plaintext HTTP carries headers unencrypted, a passive sniffer can read URLs, requested paths, and `Host:` headers directly from the raw payload bytes.
+

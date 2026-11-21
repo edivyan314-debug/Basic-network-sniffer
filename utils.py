@@ -129,3 +129,4 @@ def safe_decode_string(data: bytes) -> str:
             return data.decode("latin-1")
         except Exception:
             return "".join(chr(b) if 32 <= b <= 126 else "." for b in data)
+

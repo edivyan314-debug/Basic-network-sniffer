@@ -111,3 +111,4 @@ curl -i http://neverssl.com/
 ### What to Learn
 1. **Three-Way Handshake:** Notice packets 1, 2, and 3 carrying `SYN`, `SYN-ACK`, and `ACK` flags with 0 payload bytes before any data is sent.
 2. **Cleartext Payload:** Plaintext HTTP headers (`Host:`, `User-Agent:`) and response status codes (`200 OK`) are completely readable in the ASCII preview. This demonstrates why modern internet traffic relies on HTTPS / TLS encryption to prevent eavesdropping on sensitive credentials.
+

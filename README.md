@@ -220,3 +220,4 @@ basic-network-sniffer/
 - [ ] **GeoIP Location Mapping:** Look up geographic origins and autonomous system numbers (ASN) for public remote IP addresses.
 - [ ] **Heuristic Anomaly Alerts:** Detection triggers for rapid port scans (SYN floods, NULL scans, or XMAS scans).
 - [ ] **TLS SNI Extraction:** Parse Server Name Indication (SNI) records from TLS Client Hello handshakes to identify domains accessed over HTTPS.
+
