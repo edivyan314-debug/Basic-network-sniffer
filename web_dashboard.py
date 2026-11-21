@@ -1,15 +1,19 @@
 """
-Web Dashboard for Network Sniffer (Flask + Scapy)
-Serves a real-time browser dashboard at http://127.0.0.1:5000 (or auto-picked port).
-Includes automatic Demo Mode and manual packet injection so it works even if Npcap is missing.
+Real-Time Network Sniffer Web Dashboard & Terminal Monitor
+Captures live, authentic network traffic from the computer's network interface,
+prints each packet directly to the command line, and simultaneously streams it
+to the web dashboard at http://127.0.0.1:5000.
+
+Zero simulated/demo packets: captures 100% real physical network traffic.
 """
 
 from __future__ import annotations
 
+import argparse
 import collections
 import datetime
 import os
-import random
+import signal
 import socket
 import sys
 import threading
@@ -18,7 +22,7 @@ from typing import Any, Dict, List, Optional
 
 from flask import Flask, jsonify, render_template_string, request
 
-# Import existing packet analyzer and utilities
+# Import packet analyzer and utilities
 from analyzer import parse_scapy_packet, ParsedPacket
 from utils import (
     console,
@@ -27,41 +31,66 @@ from utils import (
     verify_system_privileges,
 )
 
-# Optional Scapy import with defensive error catching
+# Scapy packet parsing
 try:
     from scapy.all import sniff
-    from scapy.layers.inet import ICMP, IP, TCP, UDP
-    from scapy.layers.l2 import ARP, Ether
-    from scapy.layers.dns import DNS, DNSQR
-    from scapy.packet import Packet, Raw
+    from scapy.layers.inet import IP
+    from scapy.packet import Packet
     HAS_SCAPY = True
 except ImportError:
     HAS_SCAPY = False
 
 app = Flask(__name__)
 
-# In-memory thread-safe packet storage (buffer of latest 250 packets)
-MAX_PACKET_BUFFER = 250
+# Thread-safe buffer of recent real packets (latest 500 packets)
+MAX_PACKET_BUFFER = 500
 packet_buffer: collections.deque[Dict[str, Any]] = collections.deque(maxlen=MAX_PACKET_BUFFER)
 packet_lock = threading.Lock()
 
+PROTOCOL_COLORS = {
+    "TCP": "bold cyan",
+    "UDP": "bold blue",
+    "ICMP": "bold yellow",
+    "ARP": "bold magenta",
+    "DNS": "bold bright_yellow",
+    "HTTP": "bold bright_green",
+    "IP": "cyan",
+    "IPv6": "bright_cyan",
+    "OTHER": "white",
+}
 
-class SnifferState:
+
+class SnifferEngineState:
     def __init__(self) -> None:
         self.is_running = True
         self.is_paused = False
         self.packet_count = 0
+        self.total_bytes = 0
         self.error_message: Optional[str] = None
         self.status: str = "Initializing..."
-        self.demo_mode: bool = False
-        self.npcap_available: bool = False
-        self.has_admin: bool = False
+        self.capture_method: str = "Unknown"
+        self.bound_ip: str = "127.0.0.1"
+        self.verbose: bool = False
+        self.filter_proto: Optional[str] = None
 
-state = SnifferState()
+engine_state = SnifferEngineState()
+
+
+def get_primary_host_ip() -> str:
+    """Detect the active local IPv4 address connected to the local network/internet."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+    except Exception:
+        local_ip = "127.0.0.1"
+    finally:
+        s.close()
+    return local_ip
 
 
 def find_available_port(preferred_port: int = 5000, host: str = "127.0.0.1") -> int:
-    """Check if the preferred port is open; if busy, locate the next available free port."""
+    """Verify preferred port availability; if busy, allocate a free port."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.bind((host, preferred_port))
@@ -72,182 +101,175 @@ def find_available_port(preferred_port: int = 5000, host: str = "127.0.0.1") -> 
                 return s_free.getsockname()[1]
 
 
-def inject_packet_record(
-    protocol: str,
-    src: str,
-    dst: str,
-    flags: str = "-",
-    length: int = 64,
-    summary: str = "",
-    payload_data: bytes = b"",
-) -> Dict[str, Any]:
-    """Helper to append an analyzed packet record into the buffer."""
-    now_str = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    payload_hex = format_hex_ascii_dump(payload_data, max_bytes=64) if payload_data else ""
+def process_and_display_packet(parsed: ParsedPacket) -> None:
+    """
+    Core handler called for every real captured packet.
+    1. Prints directly to the command line terminal.
+    2. Buffers for the web dashboard stream.
+    """
+    if engine_state.is_paused or not engine_state.is_running:
+        return
 
+    # Check protocol filter
+    if engine_state.filter_proto and parsed.protocol.upper() != engine_state.filter_proto.upper():
+        return
+
+    # 1. Print directly to terminal (command line)
+    proto_style = PROTOCOL_COLORS.get(parsed.protocol, "white")
+    tag = f"[{proto_style}]{parsed.protocol:<5}[/{proto_style}]"
+    flags_str = f"[[yellow]{' '.join(parsed.tcp_flags)}[/yellow]] " if parsed.tcp_flags else ""
+    flow = f"{parsed.src_endpoint} [bold green]->[/bold green] {parsed.dst_endpoint}"
+    
+    line = (
+        f"[dim]{parsed.formatted_time}[/dim]  {tag}  "
+        f"{flow:<45}  {flags_str}"
+        f"[dim]len={parsed.length}[/dim]  "
+        f"[italic white]{parsed.summary}[/italic white]"
+    )
+
+    if console:
+        console.print(line)
+        if engine_state.verbose and parsed.payload:
+            dump = format_hex_ascii_dump(parsed.payload, max_bytes=64)
+            for dline in dump.splitlines():
+                console.print(f"       [dim]{dline}[/dim]")
+    else:
+        plain_line = f"{parsed.formatted_time}  {parsed.protocol:<5}  {parsed.src_endpoint} -> {parsed.dst_endpoint}  len={parsed.length}  {parsed.summary}"
+        print(plain_line)
+
+    # 2. Store in thread-safe buffer for Web Dashboard
+    payload_hex = format_hex_ascii_dump(parsed.payload, max_bytes=64) if parsed.payload else ""
     record = {
-        "id": state.packet_count + 1,
-        "timestamp": now_str,
-        "protocol": protocol,
-        "src": src,
-        "dst": dst,
-        "length": length,
-        "flags": flags,
-        "summary": summary,
+        "id": engine_state.packet_count + 1,
+        "timestamp": parsed.formatted_time,
+        "protocol": parsed.protocol,
+        "src": parsed.src_endpoint,
+        "dst": parsed.dst_endpoint,
+        "length": parsed.length,
+        "flags": " ".join(parsed.tcp_flags) if parsed.tcp_flags else "-",
+        "summary": parsed.summary,
         "payload": payload_hex,
     }
 
     with packet_lock:
-        state.packet_count += 1
+        engine_state.packet_count += 1
+        engine_state.total_bytes += parsed.length
         packet_buffer.append(record)
 
-    return record
 
+def start_live_capture(bind_ip: str) -> None:
+    """
+    Continuous real-packet capture engine.
+    Uses Scapy Layer 2 capture if available, or native Windows Raw Sockets (SIO_RCVALL).
+    """
+    engine_state.bound_ip = bind_ip
+    is_windows = os.name == "nt"
 
-def generate_synthetic_packet() -> None:
-    """Generate realistic synthetic network packet for demo/testing when wire capture is unavailable."""
-    sample_types = ["DNS", "HTTP", "ICMP", "TCP_SYN", "ARP"]
-    chosen = random.choice(sample_types)
-
-    local_ip = "192.168.1.105"
-    gateway_ip = "192.168.1.1"
-
-    if chosen == "DNS":
-        domains = ["example.com", "github.com", "google.com", "python.org", "wikipedia.org"]
-        dom = random.choice(domains)
-        dns_payload = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + bytes(dom, "utf-8") + b"\x00\x00\x01\x00\x01"
-        inject_packet_record(
-            protocol="DNS",
-            src=f"{local_ip}:{random.randint(49152, 65535)}",
-            dst="1.1.1.1:53",
-            length=len(dns_payload) + 28,
-            summary=f"Query {dom} [A]",
-            payload_data=dns_payload,
-        )
-
-    elif chosen == "HTTP":
-        paths = ["/index.html", "/api/v1/status", "/docs", "/about", "/login"]
-        path = random.choice(paths)
-        host = "neverssl.com"
-        http_raw = f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0\r\nAccept: */*\r\n\r\n".encode()
-        inject_packet_record(
-            protocol="HTTP",
-            src=f"{local_ip}:{random.randint(50000, 60000)}",
-            dst="93.184.216.34:80",
-            flags="PSH ACK",
-            length=len(http_raw) + 40,
-            summary=f"HTTP Request: GET {path} [Host: {host}]",
-            payload_data=http_raw,
-        )
-
-    elif chosen == "ICMP":
-        icmp_data = b"\x08\x00\x4d\x5b\x00\x01\x00\x01abcdefghijklmnopqrstuvw"
-        inject_packet_record(
-            protocol="ICMP",
-            src=local_ip,
-            dst="8.8.8.8",
-            length=64,
-            summary="Echo Request (code=0, id=1, seq=" + str(random.randint(1, 100)) + ")",
-            payload_data=icmp_data,
-        )
-
-    elif chosen == "TCP_SYN":
-        sport = random.randint(50000, 65000)
-        inject_packet_record(
-            protocol="TCP",
-            src=f"{local_ip}:{sport}",
-            dst="142.250.190.46:443",
-            flags="SYN",
-            length=60,
-            summary=f"Initial Connection Handshake (sport={sport} dport=443)",
-            payload_data=b"",
-        )
-
-    elif chosen == "ARP":
-        inject_packet_record(
-            protocol="ARP",
-            src=local_ip,
-            dst=gateway_ip,
-            length=42,
-            summary=f"Who has {gateway_ip}? Tell {local_ip}",
-            payload_data=b"\x00\x01\x08\x00\x06\x04\x00\x01" + b"\xaa\xbb\xcc\xdd\xee\xff",
-        )
-
-
-def background_sniffer_loop() -> None:
-    """Worker thread that executes Scapy capture, or runs demo traffic if wire capture is unavailable."""
-    global state
-
-    state.has_admin = verify_system_privileges()
-
-    def packet_callback(raw_pkt: Packet) -> None:
-        if state.is_paused or not state.is_running:
-            return
-
+    # Strategy 1: Attempt Scapy Native Layer 2 Sniffer (requires Npcap on Windows or root on Linux)
+    if HAS_SCAPY:
         try:
-            parsed: ParsedPacket = parse_scapy_packet(raw_pkt)
-            inject_packet_record(
-                protocol=parsed.protocol,
-                src=parsed.src_endpoint,
-                dst=parsed.dst_endpoint,
-                flags=" ".join(parsed.tcp_flags) if parsed.tcp_flags else "-",
-                length=parsed.length,
-                summary=parsed.summary,
-                payload_data=parsed.payload,
-            )
-        except Exception as ex:
-            print(f"[!] Error analyzing packet: {ex}", file=sys.stderr)
-
-    # Attempt live wire capture with Scapy
-    if HAS_SCAPY and state.has_admin:
-        try:
-            state.status = "Live Capture Active (Scapy)"
-            print("[*] Starting live packet capture with Scapy...")
+            engine_state.status = "Live Capture (Scapy L2)"
+            engine_state.capture_method = "Scapy L2 Driver"
+            if console:
+                console.print(f"[bold green][*] Initiating Scapy packet capture on network hardware...[/bold green]")
+            
             sniff(
-                prn=packet_callback,
+                prn=lambda pkt: process_and_display_packet(parse_scapy_packet(pkt)),
                 store=False,
-                stop_filter=lambda _: not state.is_running or state.demo_mode,
+                stop_filter=lambda _: not engine_state.is_running,
             )
             return
         except RuntimeError as rt_err:
             msg = str(rt_err)
-            if "winpcap is not installed" in msg.lower():
-                state.error_message = (
-                    "Npcap is not installed on Windows. To capture live interface packets, "
-                    "install Npcap with WinPcap-compatibility mode from https://npcap.com/#download."
-                )
-            else:
-                state.error_message = f"Scapy Runtime Error: {rt_err}"
-            print(f"\n[!] Live Capture Notice: {state.error_message}", file=sys.stderr)
+            if "winpcap is not installed" not in msg.lower():
+                engine_state.error_message = f"Scapy Capture Error: {rt_err}"
+                if console:
+                    console.print(f"[bold red][!] Scapy L2 capture unavailable: {rt_err}[/bold red]")
         except PermissionError:
-            state.error_message = "Administrator/root permissions required for live packet capture."
-            print(f"\n[!] Live Capture Notice: {state.error_message}", file=sys.stderr)
-        except Exception as e:
-            state.error_message = f"Live Capture Exception: {e}"
-            print(f"\n[!] Live Capture Notice: {state.error_message}", file=sys.stderr)
-    else:
-        if not state.has_admin:
-            state.error_message = (
-                "Running without Administrator rights. "
-                "For live hardware capture, run PowerShell as Administrator. "
-                "Currently running in Demo/Simulation Mode."
+            engine_state.error_message = "Administrator privileges required to access raw network interface."
+            if console:
+                console.print("[bold red][X] Permission Denied: Please run terminal as Administrator.[/bold red]")
+            return
+
+    # Strategy 2: Windows Native Layer 3 Raw Socket (Captures real IP packets on bind_ip without Npcap)
+    if is_windows:
+        engine_state.status = f"Live Capture (Windows Raw Socket: {bind_ip})"
+        engine_state.capture_method = f"Windows SIO_RCVALL ({bind_ip})"
+        if console:
+            console.print(
+                f"[bold cyan][*] Activating Windows Raw Socket promiscuous mode on adapter IP: {bind_ip}...[/bold cyan]"
             )
-        else:
-            state.error_message = "Npcap or Scapy unavailable. Running in Demo/Simulation Mode."
 
-    # Fallback to Demo Mode with simulated packets so the dashboard works out of the box
-    state.demo_mode = True
-    state.status = "Demo Mode (Simulating Traffic)"
-    print("[*] Running in Demo Mode: Generating simulated sample traffic...")
+        sock: Optional[socket.socket] = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
+            sock.bind((bind_ip, 0))
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            # Enable promiscuous mode to receive all incoming & outgoing host traffic
+            sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_ON)
 
-    while state.is_running:
-        if not state.is_paused and state.demo_mode:
-            generate_synthetic_packet()
-        time.sleep(random.uniform(1.2, 2.5))
+            if console:
+                console.print(f"[bold green][✓] Real-time promiscuous capture active on {bind_ip}![/bold green]")
+                console.print("[dim]Streaming all physical computer packets to terminal and dashboard...[/dim]\n" + "-" * 75)
+
+            while engine_state.is_running:
+                raw_data, _ = sock.recvfrom(65535)
+                # Parse raw IPv4 packet directly
+                try:
+                    scapy_pkt = IP(raw_data)
+                    parsed = parse_scapy_packet(scapy_pkt)
+                    process_and_display_packet(parsed)
+                except Exception:
+                    pass
+
+        except PermissionError:
+            err = (
+                "Windows strictly requires elevated Administrator rights to open raw network sockets.\n"
+                "Please close this terminal, open PowerShell as Administrator ('Run as Administrator'),\n"
+                "and execute: python web_dashboard.py"
+            )
+            engine_state.error_message = err
+            engine_state.status = "Error: Admin Rights Required"
+            if console:
+                console.print(f"\n[bold red][X] Permission Denied:[/bold red]\n{err}\n")
+            else:
+                print(f"\n[X] Permission Denied: {err}\n", file=sys.stderr)
+        except Exception as e:
+            engine_state.error_message = f"Raw socket error: {e}"
+            engine_state.status = f"Socket Error ({e})"
+            if console:
+                console.print(f"[bold red][X] Raw socket error on {bind_ip}:[/bold red] {e}")
+            else:
+                print(f"[X] Raw socket error: {e}", file=sys.stderr)
+        finally:
+            if sock:
+                try:
+                    sock.ioctl(socket.SIO_RCVALL, socket.RCVALL_OFF)
+                    sock.close()
+                except Exception:
+                    pass
+    else:
+        # Strategy 3: Linux AF_PACKET raw socket
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+            engine_state.status = "Live Capture (Linux AF_PACKET)"
+            engine_state.capture_method = "Linux AF_PACKET"
+            while engine_state.is_running:
+                raw_data, _ = sock.recvfrom(65535)
+                from scapy.layers.l2 import Ether
+                parsed = parse_scapy_packet(Ether(raw_data))
+                process_and_display_packet(parsed)
+        except PermissionError:
+            engine_state.error_message = "Root permissions required (run with: sudo python web_dashboard.py)"
+            engine_state.status = "Error: Root Required"
+            print("[X] Permission Denied: Run with sudo", file=sys.stderr)
+        except Exception as e:
+            engine_state.error_message = str(e)
+            engine_state.status = f"Socket Error: {e}"
 
 
 # =====================================================================
-# HTML Dashboard Template
+# Modern Web Dashboard HTML
 # =====================================================================
 DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -255,7 +277,7 @@ DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PyNetSniffer - Network Dashboard</title>
+    <title>PyNetSniffer - Real Network Traffic Monitor</title>
     <style>
         :root {
             --bg-main: #0b1120;
@@ -309,15 +331,16 @@ DASHBOARD_HTML = """
             border: 1px solid rgba(74, 222, 128, 0.3);
         }
 
-        .banner-info {
-            background-color: rgba(56, 189, 248, 0.1);
-            border: 1px solid rgba(56, 189, 248, 0.4);
-            color: #bae6fd;
-            padding: 10px 14px;
+        .banner-warning {
+            background-color: rgba(248, 113, 113, 0.12);
+            border: 1px solid var(--accent-red);
+            color: #fca5a5;
+            padding: 12px 16px;
             border-radius: 6px;
             margin-bottom: 15px;
+            display: none;
             font-size: 13px;
-            line-height: 1.4;
+            line-height: 1.5;
         }
 
         .stats-bar {
@@ -338,6 +361,7 @@ DASHBOARD_HTML = """
             font-size: 11px;
             color: var(--text-muted);
             text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
 
         .stat-val {
@@ -366,8 +390,6 @@ DASHBOARD_HTML = """
         }
 
         button:hover { background-color: var(--border); }
-        button.btn-primary { background-color: #0284c7; border-color: #0284c7; font-weight: bold; }
-        button.btn-primary:hover { background-color: #0369a1; }
         button.btn-danger { border-color: var(--accent-red); color: var(--accent-red); }
         button.btn-danger:hover { background-color: rgba(248, 113, 113, 0.2); }
 
@@ -421,9 +443,16 @@ DASHBOARD_HTML = """
         .proto-OTHER { background: rgba(148, 163, 184, 0.2); color: var(--text-muted); }
 
         .empty-state {
-            padding: 40px 20px;
+            padding: 45px 20px;
             text-align: center;
             color: var(--text-muted);
+        }
+
+        .empty-state code {
+            background: #060a12;
+            padding: 3px 8px;
+            border-radius: 4px;
+            color: var(--accent-green);
         }
 
         .payload-preview {
@@ -442,39 +471,40 @@ DASHBOARD_HTML = """
 
     <div class="header">
         <h1>
-            PyNetSniffer Dashboard
+            PyNetSniffer - Real Network Traffic Monitor
             <span class="badge-live" id="live-badge">Live</span>
         </h1>
         <div style="font-size: 12px; color: var(--text-muted);" id="status-text">
-            Status: Connecting...
+            Connecting...
         </div>
     </div>
 
-    <!-- Notice Banner -->
-    <div class="banner-info" id="notice-banner">
-        <strong>Notice:</strong> <span id="banner-text">Connecting to sniffer service...</span>
-    </div>
+    <!-- Error/Warning Banner -->
+    <div class="banner-warning" id="error-banner"></div>
 
     <!-- Metrics Bar -->
     <div class="stats-bar">
         <div class="stat-card">
-            <div class="stat-label">Total Packets</div>
+            <div class="stat-label">Real Packets Captured</div>
             <div class="stat-val" id="stat-total">0</div>
         </div>
         <div class="stat-card">
-            <div class="stat-label">Buffer Capacity</div>
-            <div class="stat-val" id="stat-buffer">0 / 250</div>
+            <div class="stat-label">Total Volume</div>
+            <div class="stat-val" id="stat-bytes">0 KB</div>
         </div>
         <div class="stat-card">
-            <div class="stat-label">Mode</div>
-            <div class="stat-val" style="font-size: 15px; margin-top: 6px;" id="stat-mode">Detecting...</div>
+            <div class="stat-label">Capture Adapter / IP</div>
+            <div class="stat-val" style="font-size: 15px; margin-top: 6px;" id="stat-ip">Detecting...</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Capture Engine</div>
+            <div class="stat-val" style="font-size: 14px; margin-top: 6px; color: var(--accent-blue);" id="stat-engine">Initializing</div>
         </div>
     </div>
 
     <!-- Controls -->
     <div class="controls">
-        <button class="btn-primary" onclick="injectTestPacket()">+ Inject Test Packet</button>
-        <button id="btn-pause" onclick="togglePause()">Pause Feed</button>
+        <button id="btn-pause" onclick="togglePause()">Pause Web View</button>
         <button class="btn-danger" onclick="clearPackets()">Clear Buffer</button>
         <select id="protocol-filter" onchange="renderPackets()">
             <option value="ALL">All Protocols</option>
@@ -485,6 +515,9 @@ DASHBOARD_HTML = """
             <option value="HTTP">HTTP</option>
             <option value="ARP">ARP</option>
         </select>
+        <span style="font-size: 12px; color: var(--text-muted); margin-left: auto;">
+            ⚡ Traffic displays simultaneously in command line terminal & browser
+        </span>
     </div>
 
     <!-- Table Container -->
@@ -492,12 +525,12 @@ DASHBOARD_HTML = """
         <table>
             <thead>
                 <tr>
-                    <th style="width: 45px;">#</th>
-                    <th style="width: 95px;">Time</th>
+                    <th style="width: 50px;">#</th>
+                    <th style="width: 100px;">Time</th>
                     <th style="width: 65px;">Proto</th>
                     <th>Source</th>
                     <th>Destination</th>
-                    <th style="width: 75px;">Flags</th>
+                    <th style="width: 80px;">Flags</th>
                     <th style="width: 75px;">Len</th>
                     <th>Summary</th>
                 </tr>
@@ -506,8 +539,8 @@ DASHBOARD_HTML = """
                 <tr>
                     <td colspan="8">
                         <div class="empty-state">
-                            <h3>No packets yet</h3>
-                            <p>Click "Inject Test Packet" or generate traffic with ping / curl.</p>
+                            <h3>Listening for computer traffic...</h3>
+                            <p>Browse a website or run <code>ping 8.8.8.8</code> to see live traffic appear.</p>
                         </div>
                     </td>
                 </tr>
@@ -525,17 +558,20 @@ DASHBOARD_HTML = """
                 const data = await res.json();
 
                 document.getElementById('status-text').textContent = 'Status: ' + data.status;
-                document.getElementById('stat-mode').textContent = data.demo_mode ? 'Demo / Simulation' : 'Live Capture';
+                document.getElementById('stat-ip').textContent = data.bound_ip;
+                document.getElementById('stat-engine').textContent = data.capture_method;
 
-                const bannerText = document.getElementById('banner-text');
+                const banner = document.getElementById('error-banner');
                 if (data.error) {
-                    bannerText.textContent = data.error;
+                    banner.style.display = 'block';
+                    banner.innerHTML = '<strong>Permission / Setup Notice:</strong> ' + data.error;
                 } else {
-                    bannerText.textContent = 'Live packet capture running. Click any packet row to inspect payload.';
+                    banner.style.display = 'none';
                 }
 
                 document.getElementById('stat-total').textContent = data.total_captured.toLocaleString();
-                document.getElementById('stat-buffer').textContent = data.packets.length + ' / 250';
+                const kb = (data.total_bytes / 1024).toFixed(1);
+                document.getElementById('stat-bytes').textContent = kb + ' KB';
 
                 if (!isPaused) {
                     cachedPackets = data.packets;
@@ -559,8 +595,8 @@ DASHBOARD_HTML = """
                     <tr>
                         <td colspan="8">
                             <div class="empty-state">
-                                <h3>No packets match current view</h3>
-                                <p>Click "+ Inject Test Packet" above to test immediately.</p>
+                                <h3>No matching packets in view</h3>
+                                <p>Generate traffic with <code>ping 8.8.8.8</code> or open a site in your browser.</p>
                             </div>
                         </td>
                     </tr>
@@ -602,19 +638,14 @@ DASHBOARD_HTML = """
             const btn = document.getElementById('btn-pause');
             const badge = document.getElementById('live-badge');
             if (isPaused) {
-                btn.textContent = 'Resume Feed';
+                btn.textContent = 'Resume Web View';
                 badge.textContent = 'Paused';
                 badge.style.color = '#facc15';
             } else {
-                btn.textContent = 'Pause Feed';
+                btn.textContent = 'Pause Web View';
                 badge.textContent = 'Live';
                 badge.style.color = '#4ade80';
             }
-        }
-
-        async function injectTestPacket() {
-            await fetch('/api/inject_test', { method: 'POST' });
-            fetchState();
         }
 
         async function clearPackets() {
@@ -650,19 +681,15 @@ def get_packets():
         packets_list = list(packet_buffer)
         
     return jsonify({
-        "status": state.status,
-        "error": state.error_message,
-        "is_paused": state.is_paused,
-        "demo_mode": state.demo_mode,
-        "total_captured": state.packet_count,
+        "status": engine_state.status,
+        "error": engine_state.error_message,
+        "capture_method": engine_state.capture_method,
+        "bound_ip": engine_state.bound_ip,
+        "is_paused": engine_state.is_paused,
+        "total_captured": engine_state.packet_count,
+        "total_bytes": engine_state.total_bytes,
         "packets": packets_list,
     })
-
-
-@app.route("/api/inject_test", methods=["POST"])
-def inject_test():
-    generate_synthetic_packet()
-    return jsonify({"success": True})
 
 
 @app.route("/api/clear", methods=["POST"])
@@ -672,28 +699,58 @@ def clear_buffer():
     return jsonify({"success": True})
 
 
-def start_server(port: int = 5000) -> None:
-    """Initialize sniffer thread and start local HTTP server."""
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Real-Time Network Sniffer: Simultaneous Command-Line Output & Web Dashboard",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--port", type=int, default=5000, help="Web Dashboard port (default: 5000)")
+    parser.add_argument("--ip", help="Host interface IP to bind (defaults to active host IP e.g. 192.168.1.9)")
+    parser.add_argument("-p", "--protocol", choices=["tcp", "udp", "icmp", "arp", "dns", "http"], help="Filter by protocol")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Print full payload hex dump in terminal")
+
+    args = parser.parse_args()
+
+    engine_state.verbose = args.verbose
+    engine_state.filter_proto = args.protocol
+
     display_startup_banner()
 
-    target_port = find_available_port(preferred_port=port, host="127.0.0.1")
+    # Determine host IP to capture real traffic from
+    capture_ip = args.ip or get_primary_host_ip()
+    target_port = find_available_port(preferred_port=args.port, host="127.0.0.1")
     url = f"http://127.0.0.1:{target_port}"
 
-    print(f"\n[*] Starting PyNetSniffer Web Server...")
-    if target_port != port:
-        print(f"[!] Preferred port {port} was occupied. Using port: {target_port}")
-    print(f"[✓] Dashboard URL: {url}\n")
+    if console:
+        console.print("[bold green][*] Starting PyNetSniffer Real Traffic Capture...[/bold green]")
+        console.print(f"[*] Bound Network Adapter IP: [bold cyan]{capture_ip}[/bold cyan]")
+        console.print(f"[bold cyan][✓] Web Dashboard available at:[/bold cyan] [bold underline white]{url}[/bold underline white]")
+        console.print("[*] Packets will display live below in the command line AND on the dashboard.\n" + "-" * 75)
+    else:
+        print(f"[*] Capturing real traffic on {capture_ip}")
+        print(f"[*] Web Dashboard: {url}")
 
-    sniff_thread = threading.Thread(target=background_sniffer_loop, daemon=True)
-    sniff_thread.start()
-
-    try:
+    # Start Flask in background thread so command-line is dedicated to live packet printing
+    def run_flask():
+        import logging
+        log = logging.getLogger("werkzeug")
+        log.setLevel(logging.ERROR)
         app.run(host="127.0.0.1", port=target_port, debug=False, use_reloader=False)
-    except KeyboardInterrupt:
-        print("\n[*] Shutting down Web Dashboard...")
-    finally:
-        state.is_running = False
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Graceful exit handler
+    def sig_handler(sig, frame):
+        engine_state.is_running = False
+        print("\n[*] Stopping sniffer and web server...")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, sig_handler)
+
+    # Run the live packet capture on the main thread (streaming directly to terminal)
+    start_live_capture(bind_ip=capture_ip)
 
 
 if __name__ == "__main__":
-    start_server(port=5000)
+    main()
