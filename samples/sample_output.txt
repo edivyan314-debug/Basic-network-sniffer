@@ -1,0 +1,98 @@
+╭────────────────────────── PyNetSniffer - Packet Inspection Tool ──────────────────────────╮
+│ === EDUCATIONAL AND AUTHORIZED USE ONLY ===                                               │
+│                                                                                           │
+│ This software is created strictly for academic research, defensive network engineering,  │
+│ and personal network diagnostics.                                                         │
+│                                                                                           │
+│ Capturing or analyzing network traffic on networks without explicit, written              │
+│ authorization from the network owner is strictly prohibited by law. Monitor ONLY your     │
+│ own personal lab/network or networks where you have explicit written authorization.       │
+╰───────────────────────────────────────────────────────────────────────────────────────────╯
+[*] Initializing network capture engine...
+[*] Applying BPF Filter: tcp or udp or icmp
+[*] Continuous mode. Press Ctrl+C to stop capture.
+---------------------------------------------------------------------------
+21:48:10.104  ICMP   192.168.1.100 -> 8.8.8.8                     len=74   Echo Request (code=0)
+       Payload (first 64B):
+          0000   08 00 4d 5b 00 01 00 01  61 62 63 64 65 66 67 68  |..M[....abcdefgh|
+          0010   69 6a 6b 6c 6d 6e 6f 70  71 72 73 74 75 76 77 61  |ijklmnopqrstuvwa|
+          0020   62 63 64 65 66 67 68 69                           |bcdefghi|
+21:48:10.128  ICMP   8.8.8.8 -> 192.168.1.100                     len=74   Echo Reply (code=0)
+       Payload (first 64B):
+          0000   00 00 55 5b 00 01 00 01  61 62 63 64 65 66 67 68  |..U[....abcdefgh|
+          0010   69 6a 6b 6c 6d 6e 6f 70  71 72 73 74 75 76 77 61  |ijklmnopqrstuvwa|
+          0020   62 63 64 65 66 67 68 69                           |bcdefghi|
+21:48:12.431  DNS    192.168.1.100:54210 -> 1.1.1.1:53            len=68   Query example.com [A]
+       Payload (first 64B):
+          0000   b3 a1 01 00 00 01 00 00  00 00 00 00 07 65 78 61  |.............exa|
+          0010   6d 70 6c 65 03 63 6f 6d  00 00 01 00 01           |mple.com.....|
+21:48:12.449  DNS    1.1.1.1:53 -> 192.168.1.100:54210            len=84   Response (Answers: 1)
+       Payload (first 64B):
+          0000   b3 a1 81 80 00 01 00 01  00 00 00 00 07 65 78 61  |.............exa|
+          0010   6d 70 6c 65 03 63 6f 6d  00 00 01 00 01 c0 0c 00  |mple.com........|
+          0020   01 00 01 00 00 01 2c 00  04 5d b8 d8 22           |......,...].."|
+21:48:15.012  TCP    192.168.1.100:59124 -> 93.184.216.34:80      [SYN] len=64   Length: 64 bytes
+21:48:15.045  TCP    93.184.216.34:80 -> 192.168.1.100:59124      [SYN ACK] len=60   Length: 60 bytes
+21:48:15.046  TCP    192.168.1.100:59124 -> 93.184.216.34:80      [ACK] len=52   Length: 52 bytes
+21:48:15.050  HTTP   192.168.1.100:59124 -> 93.184.216.34:80      [PSH ACK] len=138  HTTP Request: GET /index.html HTTP/1.1 [Host: example.com]
+       Payload (first 64B):
+          0000   47 45 54 20 2f 69 6e 64  65 78 2e 68 74 6d 6c 20  |GET /index.html |
+          0010   48 54 54 50 2f 31 2e 31  0d 0a 48 6f 73 74 3a 20  |HTTP/1.1..Host: |
+          0020   65 78 61 6d 70 6c 65 2e  63 6f 6d 0d 0a           |example.com..|
+21:48:15.092  HTTP   93.184.216.34:80 -> 192.168.1.100:59124      [PSH ACK] len=450  HTTP Response: HTTP/1.1 200 OK
+       Payload (first 64B):
+          0000   48 54 54 50 2f 31 2e 31  20 32 30 30 20 4f 4b 0d  |HTTP/1.1 200 OK.|
+          0010   0a 41 67 65 3a 20 34 33  35 32 38 31 0d 0a 43 61  |.Age: 435281..Ca|
+          0020   63 68 65 2d 43 6f 6e 74  72 6f 6c 3a 20 6d 61 78  |che-Control: max|
+          0030   2d 61 67 65 3d 36 30 34  38 30 30 0d 0a 43 6f 6e  |-age=604800..Con|
+          ... [386 additional bytes omitted from preview]
+21:48:15.105  TCP    192.168.1.100:59124 -> 93.184.216.34:80      [FIN ACK] len=52   Length: 52 bytes
+21:48:15.140  TCP    93.184.216.34:80 -> 192.168.1.100:59124      [FIN ACK] len=52   Length: 52 bytes
+21:48:15.141  TCP    192.168.1.100:59124 -> 93.184.216.34:80      [ACK] len=52   Length: 52 bytes
+
+^C
+[!] Interrupted by user. Finalizing capture...
+
+
+                             Session Overview                             
+┏━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃ Metric              ┃                                            Value ┃
+┡━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┩
+│ Total Packets       │                                               11 │
+│ Total Data Captured │                             1.45 KB (1,486 bytes)│
+│ Capture Duration    │                                     5.04 seconds │
+│ Average Throughput  │                     2.2 packets/sec (0.29 KB/s)  │
+└─────────────────────┴──────────────────────────────────────────────────┘
+
+
+                   Protocol Breakdown                    
+┏━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━┓
+┃ Protocol ┃ Packets ┃ Percentage ┃
+┡━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━┩
+│ TCP      │       5 │      45.5% │
+│ HTTP     │       2 │      18.2% │
+│ ICMP     │       2 │      18.2% │
+│ DNS      │       2 │      18.2% │
+└──────────┴─────────┴────────────┘
+
+
+             Top 5 Host Talkers (IP Addresses)            
+┏━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━┓
+┃ IP Address     ┃ Packets Observed ┃ Activity % ┃
+┡━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━┩
+│ 192.168.1.100  │               11 │      50.0% │
+│ 93.184.216.34  │                7 │      31.8% │
+│ 8.8.8.8        │                2 │       9.1% │
+│ 1.1.1.1        │                2 │       9.1% │
+└━━━━━━━━━━━━━━━━┴━━━━━━━━━━━━━━━━━━┴━━━━━━━━━━━━┘
+
+
+            Top 5 Transport Ports            
+┏━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┓
+┃ Port ┃ Service Name ┃ Occurrences ┃
+┡━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━━━┩
+│   80 │ HTTP         │           7 │
+│59124 │ Unassigned   │           7 │
+│   53 │ DNS          │           2 │
+│54210 │ Unassigned   │           2 │
+└──────┴──────────────┴─────────────┘
